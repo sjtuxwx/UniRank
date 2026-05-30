@@ -24,7 +24,7 @@ QK_Video_Action:
             - {name: like, dtype: float}
             - {name: share, dtype: float}
 
-KuaiRand_Video_Action:
+KuaiRand_Video_Action: &KuaiRand_Video_Action
     data_root: ./data/
     data_format: parquet
     train_data: ./data/KuaiRand_Video_Action/train.parquet
@@ -81,6 +81,15 @@ KuaiRand_Video_Action:
         - {name: is_comment, dtype: float}
         - {name: is_forward, dtype: float}
         - {name: long_view, dtype: float}
+
+
+KuaiRand_Video_Action_perday:
+    <<: *KuaiRand_Video_Action
+    train_data: ./data/KuaiRand_Video_Action_perday/0408.parquet
+    valid_data: ./data/KuaiRand_Video_Action_perday/0409.parquet
+    test_data: ./data/KuaiRand_Video_Action_perday/0409.parquet
+    user_info: ./data/KuaiRand_Video_Action_perday/user_info.parquet
+    item_info: ./data/KuaiRand_Video_Action_perday/item_info.parquet
 
 
 TencentGR_10M_Action:

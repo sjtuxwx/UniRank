@@ -13,6 +13,6 @@ from .HeMix import HeMix
 from .UniMixer import UniMixer
 from .SASRec import SASRecPretrain, SASRec
 from .SORT import SORT
-from .Alloy import Alloy
+# from .Alloy import Alloy
 from .TokenFormer import TokenFormer
 from .UltraHSTU import UltraHSTU
