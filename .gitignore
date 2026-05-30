@@ -1,0 +1,76 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local Python installs
+.venv/
+venv/
+env/
+.env
+.env.*
+.uv-python/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and runtime files
+logs/
+*.log
+*.out
+*.err
+nohup.out
+
+# Model checkpoints and training outputs
+checkpoints/**/*.model
+checkpoints/**/*.pt
+checkpoints/**/*.pth
+checkpoints/**/*.ckpt
+checkpoints/**/*.bin
+checkpoints/**/*.safetensors
+outputs/
+runs/
+wandb/
+tensorboard/
+
+# Local caches
+.cache/
+.hf-cache/
+
+# Downloaded or generated datasets
+data/**/*.parquet
+data/**/*.npz
+data/**/*.npy
+data/**/*.pkl
+data/**/feature_vocab.json
+data/**/meta_data.json
+data/**/.cache/
+data/*_Blocked/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+# Trae相关缓存和文件
+.trae/
+.trae_cache/
+trae-logs/
