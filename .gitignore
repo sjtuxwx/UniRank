@@ -55,7 +55,7 @@ tensorboard/
 # Local caches
 .cache/
 .hf-cache/
-
+checkpoints/
 # Downloaded or generated datasets
 data/
 data/**/*.parquet
