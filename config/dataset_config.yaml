@@ -85,6 +85,7 @@ KuaiRand_Video_Action: &KuaiRand_Video_Action
 
 KuaiRand_Video_Action_perday:
     <<: *KuaiRand_Video_Action
+    rolling_data_dir: ./data/KuaiRand_Video_Action_perday
     train_data: ./data/KuaiRand_Video_Action_perday/0408.parquet
     valid_data: ./data/KuaiRand_Video_Action_perday/0409.parquet
     test_data: ./data/KuaiRand_Video_Action_perday/0409.parquet

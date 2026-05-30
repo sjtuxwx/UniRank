@@ -28,6 +28,204 @@ from fuxictr.preprocess import FeatureProcessor, build_dataset
 import model_zoo
 
 
+def attach_distributed_params(params, distributed, rank, local_rank, world_size):
+    run_params = dict(params)
+    if distributed:
+        run_params.update({
+            "distributed": True,
+            "rank": rank,
+            "local_rank": local_rank,
+            "world_size": world_size
+        })
+    else:
+        run_params.update({
+            "distributed": False,
+            "rank": 0,
+            "local_rank": 0,
+            "world_size": 1
+        })
+    return run_params
+
+
+def make_train_valid_iterators(feature_map, params, distributed, rank, local_rank, world_size):
+    train_params = attach_distributed_params(params, distributed, rank, local_rank, world_size)
+    return RankDataLoader(feature_map, stage='train', **train_params).make_iterator()
+
+
+def make_test_iterator(feature_map, params, distributed, rank, local_rank, world_size):
+    test_params = attach_distributed_params(params, distributed, rank, local_rank, world_size)
+    return RankDataLoader(feature_map, stage='test', **test_params).make_iterator()
+
+
+def list_rolling_day_files(params):
+    rolling_dir = params.get("rolling_data_dir", None)
+    if rolling_dir is None:
+        train_data = params.get("train_data", None)
+        if train_data is None:
+            raise ValueError("rolling_train=True requires rolling_data_dir or train_data.")
+        rolling_dir = str(Path(train_data).parent)
+
+    rolling_dir = Path(rolling_dir)
+    if not rolling_dir.exists():
+        raise FileNotFoundError(f"rolling_data_dir does not exist: {rolling_dir}")
+
+    start_day = params.get("rolling_start_day", None)
+    end_day = params.get("rolling_end_day", None)
+    start_day = str(start_day) if start_day is not None else None
+    end_day = str(end_day) if end_day is not None else None
+
+    day_files = []
+    for path in sorted(rolling_dir.glob("*.parquet")):
+        day = path.stem
+        if len(day) != 4 or (not day.isdigit()):
+            continue
+        if start_day is not None and day < start_day:
+            continue
+        if end_day is not None and day > end_day:
+            continue
+        day_files.append((day, str(path)))
+
+    if len(day_files) < 2:
+        raise ValueError(
+            f"Rolling training needs at least 2 day parquet files, got {len(day_files)} "
+            f"from {rolling_dir} with start_day={start_day}, end_day={end_day}."
+        )
+    return day_files
+
+
+def build_rolling_pairs(day_files):
+    pairs = []
+    for idx in range(len(day_files) - 1):
+        train_day, train_data = day_files[idx]
+        valid_day, valid_data = day_files[idx + 1]
+        pairs.append({
+            "train_day": train_day,
+            "train_data": train_data,
+            "valid_day": valid_day,
+            "valid_data": valid_data,
+            "is_final": idx == len(day_files) - 2
+        })
+    return pairs
+
+
+def rolling_checkpoint_path(base_checkpoint, train_day, valid_day):
+    base_path = Path(base_checkpoint)
+    checkpoint_dir = base_path.parent / "rolling"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    suffix = base_path.suffix or ".model"
+    return str(checkpoint_dir / f"{base_path.stem}_{train_day}_to_{valid_day}{suffix}")
+
+
+def run_standard_training(model, feature_map, params, distributed, rank, local_rank, world_size):
+    params["data_loader"] = UniRankDataloader
+
+    train_gen, valid_gen = make_train_valid_iterators(
+        feature_map, params, distributed, rank, local_rank, world_size
+    )
+
+    if distributed and dist.is_initialized():
+        dist.barrier()
+    model.fit(train_gen, validation_data=valid_gen, **params)
+
+    del train_gen, valid_gen
+    gc.collect()
+
+    if params.get("test_data", None):
+        if is_main_process(rank):
+            logging.info('******** Test evaluation ********')
+
+        test_gen = make_test_iterator(
+            feature_map, params, distributed, rank, local_rank, world_size
+        )
+
+        if distributed and dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        model.evaluate(test_gen)
+
+        del test_gen
+        gc.collect()
+
+
+def run_rolling_training(model, feature_map, params, distributed, rank, local_rank, world_size):
+    params["data_loader"] = UniRankDataloader
+
+    day_files = list_rolling_day_files(params)
+    rolling_pairs = build_rolling_pairs(day_files)
+    rolling_epochs = int(params.get("rolling_epochs_per_day", params.get("epochs", 1)))
+    original_eval_steps = params.get("eval_steps", None)
+    base_checkpoint = model.checkpoint
+
+    if is_main_process(rank):
+        logging.info("******** Rolling training enabled ********")
+        logging.info("Rolling days: " + " - ".join([x[0] for x in day_files]))
+        logging.info("Rolling epochs per day: {}".format(rolling_epochs))
+
+    final_valid_data = rolling_pairs[-1]["valid_data"]
+    final_valid_day = rolling_pairs[-1]["valid_day"]
+    final_checkpoint = None
+
+    for step, pair in enumerate(rolling_pairs, start=1):
+        day_params = dict(params)
+        day_params["epochs"] = rolling_epochs
+        day_params["train_data"] = pair["train_data"]
+        day_params["valid_data"] = pair["valid_data"]
+        day_params["test_data"] = None
+
+        model.checkpoint = rolling_checkpoint_path(
+            base_checkpoint, pair["train_day"], pair["valid_day"]
+        )
+        model._eval_steps = original_eval_steps
+
+        if is_main_process(rank):
+            logging.info(
+                "******** Rolling step {}/{}: train={} valid={} checkpoint={} ********"
+                .format(
+                    step,
+                    len(rolling_pairs),
+                    pair["train_day"],
+                    pair["valid_day"],
+                    model.checkpoint
+                )
+            )
+
+        if distributed and dist.is_initialized():
+            dist.barrier()
+
+        train_gen, valid_gen = make_train_valid_iterators(
+            feature_map, day_params, distributed, rank, local_rank, world_size
+        )
+        model.fit(train_gen, validation_data=valid_gen, **day_params)
+
+        final_checkpoint = model.checkpoint
+        del train_gen, valid_gen
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if distributed and dist.is_initialized():
+            dist.barrier()
+
+    if is_main_process(rank):
+        logging.info(
+            "******** Final rolling evaluation: day={} checkpoint={} ********"
+            .format(final_valid_day, final_checkpoint)
+        )
+
+    final_params = dict(params)
+    final_params["test_data"] = final_valid_data
+    test_gen = make_test_iterator(
+        feature_map, final_params, distributed, rank, local_rank, world_size
+    )
+
+    if distributed and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    model.evaluate(test_gen)
+
+    del test_gen
+    gc.collect()
+    model.checkpoint = base_checkpoint
+
+
 if __name__ == '__main__':
     """
     单卡:
@@ -153,60 +351,14 @@ if __name__ == '__main__':
         if is_main_process(rank):
             model.count_parameters()
 
-        # --------------------
-        # Build data iterators
-        # --------------------
-        params["data_loader"] = UniRankDataloader
-
-        if distributed:
-            train_params = dict(params)
-            train_params.update({
-                "distributed": True,
-                "rank": rank,
-                "local_rank": local_rank,
-                "world_size": world_size
-            })
-            # 所有 rank 都构建 train 和 valid，验证时各 rank 并行推理后 all_gather 汇聚
-            train_gen, valid_gen = RankDataLoader(feature_map, stage='train', **train_params).make_iterator()
+        if params.get("rolling_train", False):
+            run_rolling_training(
+                model, feature_map, params, distributed, rank, local_rank, world_size
+            )
         else:
-            train_gen, valid_gen = RankDataLoader(feature_map, stage='train', **params).make_iterator()
-
-
-        if distributed and dist.is_initialized():
-            dist.barrier()
-        model.fit(train_gen, validation_data=valid_gen, **params)
-
-        del train_gen, valid_gen
-        gc.collect()
-
-        if params.get("test_data", None):
-            if is_main_process(rank):
-                logging.info('******** Test evaluation ********')
-
-            test_params = dict(params)
-            if distributed:
-                test_params.update({
-                    "distributed": True,
-                    "rank": rank,
-                    "local_rank": local_rank,
-                    "world_size": world_size
-                })
-            else:
-                test_params.update({
-                    "distributed": False,
-                    "rank": 0,
-                    "local_rank": 0,
-                    "world_size": 1
-                })
-
-            test_gen = RankDataLoader(feature_map, stage='test', **test_params).make_iterator()
-
-            if distributed and dist.is_available() and dist.is_initialized():
-                dist.barrier()
-            model.evaluate(test_gen)
-
-            del test_gen
-            gc.collect()
+            run_standard_training(
+                model, feature_map, params, distributed, rank, local_rank, world_size
+            )
 
     finally:
         if distributed and dist.is_available() and dist.is_initialized():
