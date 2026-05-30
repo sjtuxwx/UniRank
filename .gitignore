@@ -57,6 +57,7 @@ tensorboard/
 .hf-cache/
 
 # Downloaded or generated datasets
+data/
 data/**/*.parquet
 data/**/*.npz
 data/**/*.npy
