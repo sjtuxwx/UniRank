@@ -17,8 +17,11 @@
 
 import glob
 import json
+import logging
+import os
 import random
 import re
+import resource
 from collections import OrderedDict
 from pathlib import Path
 
@@ -29,6 +32,56 @@ import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.distributed import DistributedSampler
+
+
+_FULL_SIDE_INFO_CACHE = {}
+
+
+def _read_proc_status_kb():
+    mem = {}
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmHWM:", "VmSize:", "RssAnon:", "RssFile:", "RssShmem:")):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mem[parts[0].rstrip(":")] = int(parts[1])
+    except OSError:
+        pass
+    return mem
+
+
+def _kb_to_gb(value):
+    return float(value or 0) / 1024.0 / 1024.0
+
+
+def log_memory(stage, rank=None):
+    mem = _read_proc_status_kb()
+    ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    pieces = [
+        f"[MEM] stage={stage}",
+        f"pid={os.getpid()}",
+    ]
+    if rank is not None:
+        pieces.append(f"rank={rank}")
+    pieces.extend([
+        f"rss_gb={_kb_to_gb(mem.get('VmRSS')):.3f}",
+        f"hwm_gb={_kb_to_gb(mem.get('VmHWM', ru_maxrss)):.3f}",
+        f"vms_gb={_kb_to_gb(mem.get('VmSize')):.3f}",
+        f"anon_gb={_kb_to_gb(mem.get('RssAnon')):.3f}",
+        f"file_gb={_kb_to_gb(mem.get('RssFile')):.3f}",
+        f"shmem_gb={_kb_to_gb(mem.get('RssShmem')):.3f}",
+    ])
+    if torch.cuda.is_available():
+        try:
+            pieces.extend([
+                f"cuda_alloc_gb={torch.cuda.memory_allocated() / 1024 ** 3:.3f}",
+                f"cuda_reserved_gb={torch.cuda.memory_reserved() / 1024 ** 3:.3f}",
+                f"cuda_max_alloc_gb={torch.cuda.max_memory_allocated() / 1024 ** 3:.3f}",
+            ])
+        except Exception:
+            pass
+    logging.info(" | ".join(pieces))
 
 
 def _resolve_parquet_files(data_path):
@@ -283,9 +336,11 @@ class ParquetDataset(Dataset):
         self.files = _resolve_parquet_files(data_path)
         self.columns = columns
         self.column_index = {}
+        log_memory(f"ParquetDataset.init.start files={len(self.files)} path={data_path}")
         self.darray = self.load_data()
         self.num_blocks = len(self.files)
         self.num_samples = int(self.darray.shape[0])
+        log_memory(f"ParquetDataset.init.end rows={self.num_samples} cols={self.darray.shape[1]}")
 
     def __getitem__(self, index):
         return self.darray[index, :]
@@ -294,9 +349,13 @@ class ParquetDataset(Dataset):
         return self.darray.shape[0]
 
     def load_data(self):
+        log_memory(f"ParquetDataset.load_data.before_read files={len(self.files)}")
         dfs = [pd.read_parquet(fp, columns=self.columns) for fp in self.files]
+        log_memory(f"ParquetDataset.load_data.after_read_parquet frames={len(dfs)}")
         df = dfs[0] if len(dfs) == 1 else pd.concat(dfs, axis=0, ignore_index=True)
+        log_memory(f"ParquetDataset.load_data.after_concat rows={len(df)} cols={len(df.columns)}")
         darray, column_index = _dataframe_to_darray(df)
+        log_memory(f"ParquetDataset.load_data.after_to_darray shape={darray.shape}")
         self.column_index = column_index
         return darray
 
@@ -523,6 +582,11 @@ class UniRankDataloader(DataLoader):
 
         self.blocked = kwargs.pop("blocked", False)
         self.block_cache_size = kwargs.pop("block_cache_size", 2)
+        log_memory(
+            f"UniRankDataloader.init.start split={split} blocked={self.blocked} "
+            f"batch_size={batch_size} num_workers={num_workers} data_path={data_path}",
+            rank=rank
+        )
 
         user_info = _resolve_side_info_path(
             split=self.split,
@@ -536,10 +600,16 @@ class UniRankDataloader(DataLoader):
             explicit_path=item_info,
             kwargs=kwargs
         )
+        log_memory(
+            f"UniRankDataloader.init.after_resolve_side split={split} "
+            f"user_info={user_info} item_info={item_info}",
+            rank=rank
+        )
 
         sampler = None
 
         if self.blocked:
+            log_memory(f"UniRankDataloader.blocked.before_dataset split={split}", rank=rank)
             self.dataset = BlockedParquetBatchDataset(
                 data_path=data_path,
                 user_info_path=user_info,
@@ -551,6 +621,11 @@ class UniRankDataloader(DataLoader):
                 rank=rank,
                 world_size=world_size,
                 drop_last=drop_last
+            )
+            log_memory(
+                f"UniRankDataloader.blocked.after_dataset split={split} "
+                f"samples={self.dataset.num_samples} blocks={self.dataset.num_blocks}",
+                rank=rank
             )
             if distributed:
                 print(
@@ -572,10 +647,17 @@ class UniRankDataloader(DataLoader):
                 padding=padding,
                 cache_size=self.block_cache_size
             )
+            log_memory(f"UniRankDataloader.blocked.after_collator split={split}", rank=rank)
         else:
+            log_memory(f"UniRankDataloader.full.before_dataset split={split}", rank=rank)
             self.dataset = ParquetDataset(
                 data_path=data_path,
                 columns=None
+            )
+            log_memory(
+                f"UniRankDataloader.full.after_dataset split={split} "
+                f"samples={self.dataset.num_samples} blocks={self.dataset.num_blocks}",
+                rank=rank
             )
 
             if distributed:
@@ -597,6 +679,7 @@ class UniRankDataloader(DataLoader):
                 item_info=item_info,
                 padding=padding
             )
+            log_memory(f"UniRankDataloader.full.after_collator split={split}", rank=rank)
 
         self.sampler_ref = sampler
 
@@ -612,6 +695,7 @@ class UniRankDataloader(DataLoader):
             prefetch_factor=4 if num_workers > 0 else None,
             collate_fn=collate_fn
         )
+        log_memory(f"UniRankDataloader.init.after_torch_dataloader split={split}", rank=rank)
 
         self._configured_batch_size = int(batch_size)
         self.num_blocks = getattr(self.dataset, "num_blocks", 1)
@@ -659,12 +743,40 @@ class BatchCollator(object):
         self.all_cols = set(list(feature_map.features.keys()) + feature_map.labels)
         self.batch_cols = [(col, idx) for col, idx in column_index.items() if col in self.all_cols]
         self.task_labels = list(feature_map.labels)
+        log_memory(
+            f"BatchCollator.init.start user_info={user_info} item_info={item_info} "
+            f"max_len={max_len} features={len(self.all_cols)}"
+        )
+
+        cache_key = (
+            str(Path(user_info).resolve()),
+            str(Path(item_info).resolve()),
+            tuple(sorted(self.all_cols)),
+            tuple(self.task_labels),
+        )
+        cached = _FULL_SIDE_INFO_CACHE.get(cache_key)
+        if cached is not None:
+            self.user_index_min = cached["user_index_min"]
+            self.user_index_max = cached["user_index_max"]
+            self.user_row_lookup = cached["user_row_lookup"]
+            self.user_item_seqs = cached["user_item_seqs"]
+            self.user_action_seqs = cached["user_action_seqs"]
+            self.action_task_table = cached["action_task_table"]
+            self.item_index_min = cached["item_index_min"]
+            self.item_index_max = cached["item_index_max"]
+            self.item_row_lookup = cached["item_row_lookup"]
+            self.item_tensors = cached["item_tensors"]
+            log_memory("BatchCollator.init.cache_hit")
+            return
 
         user_cols = ["user_index", "full_item_seq", "full_action_seq"]
+        log_memory("BatchCollator.user_info.before_read_parquet")
         user_df = pd.read_parquet(user_info, columns=user_cols)
+        log_memory(f"BatchCollator.user_info.after_read_parquet rows={len(user_df)} cols={len(user_df.columns)}")
 
         if "user_index" in user_df.columns:
             user_df = user_df.set_index("user_index").sort_index()
+            log_memory(f"BatchCollator.user_info.after_set_index_sort rows={len(user_df)}")
             user_indices = user_df.index.to_numpy(dtype=np.int64)
             self.user_index_min = int(user_indices.min())
             self.user_index_max = int(user_indices.max())
@@ -684,6 +796,10 @@ class BatchCollator(object):
 
         self.user_item_seqs = user_df["full_item_seq"].to_numpy()
         self.user_action_seqs = user_df["full_action_seq"].to_numpy()
+        log_memory(
+            "BatchCollator.user_info.after_sequence_to_numpy "
+            f"user_index_range={self.user_index_min}:{self.user_index_max}"
+        )
 
         meta_fp = _find_meta_data_json(user_info)
         try:
@@ -700,6 +816,7 @@ class BatchCollator(object):
             )
 
         self.action_task_table = self._build_action_task_table(action_vocab)
+        log_memory("BatchCollator.action_task_table.ready")
 
         item_schema = _get_parquet_schema_names(item_info)
         item_cols = ["item_index"] + [col for col in self.all_cols if col not in {"action", "item_index"}]
@@ -708,11 +825,14 @@ class BatchCollator(object):
         if "item_index" not in item_cols:
             raise ValueError("item_info 中缺少 item_index 列。")
 
+        log_memory(f"BatchCollator.item_info.before_read_parquet cols={item_cols}")
         item_df = pd.read_parquet(item_info, columns=item_cols).set_index("item_index").sort_index()
+        log_memory(f"BatchCollator.item_info.after_read_set_index_sort rows={len(item_df)} cols={len(item_df.columns)}")
 
         if 0 not in item_df.index:
             item_df.loc[0] = 0
             item_df = item_df.sort_index()
+            log_memory("BatchCollator.item_info.after_add_padding_row")
 
         item_indices = item_df.index.to_numpy(dtype=np.int64)
         self.item_index_min = int(item_indices.min())
@@ -732,6 +852,25 @@ class BatchCollator(object):
             if col in self.all_cols:
                 col_array = np.ascontiguousarray(item_df[col].to_numpy(copy=True))
                 self.item_tensors[col] = torch.from_numpy(col_array)
+        log_memory(
+            "BatchCollator.item_info.after_tensorize "
+            f"item_index_range={self.item_index_min}:{self.item_index_max} "
+            f"item_tensor_cols={len(self.item_tensors)}"
+        )
+
+        _FULL_SIDE_INFO_CACHE[cache_key] = {
+            "user_index_min": self.user_index_min,
+            "user_index_max": self.user_index_max,
+            "user_row_lookup": self.user_row_lookup,
+            "user_item_seqs": self.user_item_seqs,
+            "user_action_seqs": self.user_action_seqs,
+            "action_task_table": self.action_task_table,
+            "item_index_min": self.item_index_min,
+            "item_index_max": self.item_index_max,
+            "item_row_lookup": self.item_row_lookup,
+            "item_tensors": self.item_tensors,
+        }
+        log_memory(f"BatchCollator.init.cache_store cache_size={len(_FULL_SIDE_INFO_CACHE)}")
 
     def _build_action_task_table(self, action_vocab):
         max_action_id = max(int(v) for v in action_vocab.values()) if len(action_vocab) > 0 else 0

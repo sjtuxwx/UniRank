@@ -22,7 +22,7 @@ from fuxictr.utils import (
 )
 from fuxictr.features import FeatureMap
 from fuxictr.pytorch.dataloaders import RankDataLoader
-from UniRank_Dataloader import UniRankDataloader
+from UniRank_Dataloader import UniRankDataloader, log_memory
 from fuxictr.pytorch.torch_utils import seed_everything
 from fuxictr.preprocess import FeatureProcessor, build_dataset
 import model_zoo
@@ -49,12 +49,18 @@ def attach_distributed_params(params, distributed, rank, local_rank, world_size)
 
 def make_train_valid_iterators(feature_map, params, distributed, rank, local_rank, world_size):
     train_params = attach_distributed_params(params, distributed, rank, local_rank, world_size)
-    return RankDataLoader(feature_map, stage='train', **train_params).make_iterator()
+    log_memory("run.make_train_valid_iterators.before", rank=rank)
+    train_gen, valid_gen = RankDataLoader(feature_map, stage='train', **train_params).make_iterator()
+    log_memory("run.make_train_valid_iterators.after", rank=rank)
+    return train_gen, valid_gen
 
 
 def make_test_iterator(feature_map, params, distributed, rank, local_rank, world_size):
     test_params = attach_distributed_params(params, distributed, rank, local_rank, world_size)
-    return RankDataLoader(feature_map, stage='test', **test_params).make_iterator()
+    log_memory("run.make_test_iterator.before", rank=rank)
+    test_gen = RankDataLoader(feature_map, stage='test', **test_params).make_iterator()
+    log_memory("run.make_test_iterator.after", rank=rank)
+    return test_gen
 
 
 def list_rolling_day_files(params):
@@ -125,10 +131,13 @@ def run_standard_training(model, feature_map, params, distributed, rank, local_r
 
     if distributed and dist.is_initialized():
         dist.barrier()
+    log_memory("run_standard.before_fit", rank=rank)
     model.fit(train_gen, validation_data=valid_gen, **params)
+    log_memory("run_standard.after_fit", rank=rank)
 
     del train_gen, valid_gen
     gc.collect()
+    log_memory("run_standard.after_del_train_valid_gc", rank=rank)
 
     if params.get("test_data", None):
         if is_main_process(rank):
@@ -140,10 +149,13 @@ def run_standard_training(model, feature_map, params, distributed, rank, local_r
 
         if distributed and dist.is_available() and dist.is_initialized():
             dist.barrier()
+        log_memory("run_standard.before_test_evaluate", rank=rank)
         model.evaluate(test_gen)
+        log_memory("run_standard.after_test_evaluate", rank=rank)
 
         del test_gen
         gc.collect()
+        log_memory("run_standard.after_del_test_gc", rank=rank)
 
 
 def run_rolling_training(model, feature_map, params, distributed, rank, local_rank, world_size):
@@ -191,16 +203,25 @@ def run_rolling_training(model, feature_map, params, distributed, rank, local_ra
         if distributed and dist.is_initialized():
             dist.barrier()
 
+        log_memory(
+            f"run_rolling.step{step}.before_make_iterators "
+            f"train={pair['train_day']} valid={pair['valid_day']}",
+            rank=rank
+        )
         train_gen, valid_gen = make_train_valid_iterators(
             feature_map, day_params, distributed, rank, local_rank, world_size
         )
+        log_memory(f"run_rolling.step{step}.after_make_iterators", rank=rank)
+        log_memory(f"run_rolling.step{step}.before_fit", rank=rank)
         model.fit(train_gen, validation_data=valid_gen, **day_params)
+        log_memory(f"run_rolling.step{step}.after_fit", rank=rank)
 
         final_checkpoint = model.checkpoint
         del train_gen, valid_gen
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        log_memory(f"run_rolling.step{step}.after_del_train_valid_gc", rank=rank)
 
         if distributed and dist.is_initialized():
             dist.barrier()
@@ -213,16 +234,21 @@ def run_rolling_training(model, feature_map, params, distributed, rank, local_ra
 
     final_params = dict(params)
     final_params["test_data"] = final_valid_data
+    log_memory("run_rolling.final.before_make_test_iterator", rank=rank)
     test_gen = make_test_iterator(
         feature_map, final_params, distributed, rank, local_rank, world_size
     )
+    log_memory("run_rolling.final.after_make_test_iterator", rank=rank)
 
     if distributed and dist.is_available() and dist.is_initialized():
         dist.barrier()
+    log_memory("run_rolling.final.before_evaluate", rank=rank)
     model.evaluate(test_gen)
+    log_memory("run_rolling.final.after_evaluate", rank=rank)
 
     del test_gen
     gc.collect()
+    log_memory("run_rolling.final.after_del_test_gc", rank=rank)
     model.checkpoint = base_checkpoint
 
 
@@ -299,6 +325,7 @@ if __name__ == '__main__':
         if is_main_process(rank):
             set_logger(params)
             logging.info("Params: " + print_to_json(params))
+            log_memory("run.after_logger", rank=rank)
         else:
             logging.getLogger().handlers = []
             logging.basicConfig(level=logging.ERROR)
@@ -314,6 +341,7 @@ if __name__ == '__main__':
                 feature_encoder = FeatureProcessor(**params)
                 params["train_data"], params["valid_data"], params["test_data"] = \
                     build_dataset(feature_encoder, **params)
+                log_memory("run.after_build_dataset_main_rank", rank=rank)
 
             obj_list = [[
                 params.get("train_data", None),
@@ -328,15 +356,20 @@ if __name__ == '__main__':
             feature_encoder = FeatureProcessor(**params)
             params["train_data"], params["valid_data"], params["test_data"] = \
                 build_dataset(feature_encoder, **params)
+            log_memory("run.after_build_dataset", rank=rank)
 
         feature_map = FeatureMap(params['dataset_id'], data_dir)
         feature_map.load(feature_map_json, params)
         if is_main_process(rank):
             logging.info("Feature specs: " + print_to_json(feature_map.features))
+            log_memory("run.after_feature_map_load", rank=rank)
 
         model_class = getattr(model_zoo, params['model'])
+        log_memory("run.before_model_init", rank=rank)
         model = model_class(feature_map, **params)
+        log_memory("run.after_model_init_compile", rank=rank)
         model.model_to_device()
+        log_memory("run.after_model_to_device", rank=rank)
 
         if distributed:
             ddp_model = DDP(
@@ -347,9 +380,11 @@ if __name__ == '__main__':
             )
             # 依赖你前面改过的 rank_model.py
             model.set_ddp_model(ddp_model)
+            log_memory("run.after_ddp_wrap", rank=rank)
 
         if is_main_process(rank):
             model.count_parameters()
+            log_memory("run.after_count_parameters", rank=rank)
 
         if params.get("rolling_train", False):
             run_rolling_training(
