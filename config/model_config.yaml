@@ -76,6 +76,42 @@ DIN_KuaiRand_Video_Action: # This is a config template
     max_len: 100
     accumulation_steps: 1
 
+DIN_KuaiRand_Video_Action_perday_rolling:
+    model: DIN
+    dataset_id: KuaiRand_Video_Action_perday
+    rolling_train: True
+    rolling_epochs_per_day: 1
+    rolling_start_day: "0407"
+    rolling_end_day: "0508"
+    loss: ['binary_crossentropy', 'binary_crossentropy', 'binary_crossentropy', 'binary_crossentropy', 'binary_crossentropy', 'binary_crossentropy']
+    metrics: ['logloss', 'AUC', 'gAUC']
+    task: binary_classification
+    optimizer: adam
+    learning_rate: 1.0e-3
+    embedding_regularizer: 0
+    net_regularizer: 0
+    batch_size: 8192
+    embedding_dim: 16
+    dnn_hidden_units: [400, 400, 400]
+    tower_hidden_units: [128, 64]
+    num_tasks: 6
+    dnn_activations: ReLU
+    tower_activations: ReLU
+    attention_hidden_units: [256, 128]
+    attention_hidden_activations: "Dice"
+    attention_output_activation: null
+    attention_dropout: 0
+    din_use_softmax: True
+    net_dropout: 0
+    batch_norm: False
+    epochs: 1
+    shuffle: True
+    seed: 20262027
+    monitor: {'AUC': 1, 'logloss': 0, 'gAUC': 1}
+    monitor_mode: 'max'
+    max_len: 100
+    accumulation_steps: 1
+
 
 DIN_TencentGR_10M_Action: # This is a config template
     model: DIN
