@@ -1,0 +1,18 @@
+project_root: ..
+model_config: ../config/model_config.yaml
+dataset_config: ../config/dataset_config.yaml
+checkpoint_root: ../checkpoints
+result_root: ./results
+default_device: 0
+default_eval_batch_size: 8192
+
+datasets:
+  QK:
+    standard_dataset_id: QK_Video_Action
+    perday_dataset_id: null
+  KuaiRand:
+    standard_dataset_id: KuaiRand_Video_Action
+    perday_dataset_id: KuaiRand_Video_Action_perday
+  TencentGR:
+    standard_dataset_id: TencentGR_10M_Action
+    perday_dataset_id: null

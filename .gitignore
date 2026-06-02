@@ -75,3 +75,5 @@ temp/
 .trae/
 .trae_cache/
 trae-logs/
+fair_tool/results/
+.codex/

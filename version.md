@@ -1,10 +1,5 @@
 这个是dev分支 用于合并需求
 下面是合并记录：
-branch: feature/V1/1/fix_memory
-version: V1.1
-description: 通过拆分数据集为单天 修复内存过大的问题
-
-branch: feature/V1/2/roll_train
-version: V1.1
-description: 通过拆分数据集为单天 修复内存过大的问题
-
+branch: feature/V2/1/ckpt_load_fn
+version: V2.1 
+description: 添加好模型load的功能 方便后期进行公平性评测
